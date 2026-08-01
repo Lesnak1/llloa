@@ -167,16 +167,9 @@ module.exports = async function handler(req, res) {
           const bestBid = bids.length ? Number(bids[0].price || bids[0][0]) : currentPrice;
           const bestAsk = asks.length ? Number(asks[0].price || asks[0][0]) : currentPrice;
 
-          // ── FLASH CRASH SELL-PRICE FLOOR ──
-          // Enforce minimum sell price from strategy (entry * 0.92)
-          // This prevents catastrophic fills during flash crashes
-          const minSellPrice = exitEvaluation.minSellPrice || 0;
-
           if (qty > 0) {
-            // Close LONG -> Limit Sell at MAX(bestBid, minSellPrice)
-            const safeSellPrice = Math.max(bestBid || currentPrice, minSellPrice);
-            addLog(`Flash crash floor: bestBid=$${bestBid}, minSellPrice=$${minSellPrice}, using=$${safeSellPrice}`);
-            exitRes = await client.limitSell(propId, tokenName, Math.abs(qty), safeSellPrice);
+            // Close LONG -> Limit Sell at bestBid (fills immediately at best market price)
+            exitRes = await client.limitSell(propId, tokenName, Math.abs(qty), bestBid || currentPrice);
           } else {
             // Close SHORT -> Limit Buy at bestAsk
             exitRes = await client.limitBuy(propId, tokenName, Math.abs(qty), bestAsk || currentPrice);
