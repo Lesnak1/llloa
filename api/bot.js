@@ -154,12 +154,19 @@ module.exports = async function handler(req, res) {
           let exitRes;
           const propId = pos.propertyId || matchingAnalysis.propertyId;
 
+          // Fetch orderbook detail to place slippage-protected limit exit order at bestBid
+          const exitDetail = await client.getMarketDetail(tokenName);
+          const bids = exitDetail?.bids || exitDetail?.orderBook?.bids || [];
+          const asks = exitDetail?.asks || exitDetail?.orderBook?.asks || [];
+          const bestBid = bids.length ? Number(bids[0].price || bids[0][0]) : currentPrice;
+          const bestAsk = asks.length ? Number(asks[0].price || asks[0][0]) : currentPrice;
+
           if (qty > 0) {
-            // Close LONG -> Market Sell
-            exitRes = await client.marketSell(propId, tokenName, Math.abs(qty));
+            // Close LONG -> Limit Sell at bestBid (prevents orderbook slippage)
+            exitRes = await client.limitSell(propId, tokenName, Math.abs(qty), bestBid || currentPrice);
           } else {
-            // Close SHORT -> Market Buy
-            exitRes = await client.marketBuy(propId, tokenName, Math.abs(qty));
+            // Close SHORT -> Limit Buy at bestAsk
+            exitRes = await client.limitBuy(propId, tokenName, Math.abs(qty), bestAsk || currentPrice);
           }
 
           closedPositionsSummary.push({
