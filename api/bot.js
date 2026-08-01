@@ -225,15 +225,8 @@ module.exports = async function handler(req, res) {
           price: obValidation.bestAsk
         });
 
-        // Place Order (Passive limit order at best ask or market order depending on strength)
-        let orderRes;
-        if (opp.signal === Signal.STRONG_BUY) {
-          // Market order for immediate fill on high conviction
-          orderRes = await client.marketBuy(opp.propertyId, opp.tokenName, posSizing.quantity);
-        } else {
-          // Limit order at best ask to avoid overpaying
-          orderRes = await client.limitBuy(opp.propertyId, opp.tokenName, posSizing.quantity, obValidation.bestAsk);
-        }
+        // Place Order (Always use Limit Order at bestAsk to eliminate orderbook spread slippage)
+        let orderRes = await client.limitBuy(opp.propertyId, opp.tokenName, posSizing.quantity, obValidation.bestAsk);
 
         executedTradesSummary.push({
           tokenName: opp.tokenName,
