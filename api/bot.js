@@ -73,8 +73,8 @@ module.exports = async function handler(req, res) {
       const propertyId = prop.propertyId || prop.id;
 
       try {
-        // Fetch 1h candles (last 100)
-        const candleRes = await client.getCandles(tokenName, '1h', 100);
+        // Fetch 15m candles (last 100 candles = ~25 hours of high-resolution data)
+        const candleRes = await client.getCandles(tokenName, '15m', 100);
         const candles = candleRes.candles || candleRes.items || candleRes || [];
 
         if (candles.length > 0) {
