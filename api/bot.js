@@ -1,0 +1,238 @@
+/**
+ * Vercel Serverless Function — Main Bot Loop
+ * 
+ * Executed periodically (via Cron or HTTP call).
+ * Flow:
+ *  1. Authenticate secret token
+ *  2. Fetch portfolio & current positions
+ *  3. Scan all tradeable properties on Loaf Markets
+ *  4. Manage existing open positions (Stop-loss / Take-profit / Trailing Stop)
+ *  5. Evaluate new trading opportunities using technical analysis (RSI, EMA, MACD, Volume)
+ *  6. Apply strict Risk Management & place orders
+ *  7. Return comprehensive execution summary
+ */
+
+const { LoafClient } = require('../lib/loaf-client');
+const { analyzeAsset, rankOpportunities, shouldClosePosition, Signal } = require('../lib/strategy');
+const { calculatePositionSize, validateOrderBook } = require('../lib/risk');
+const { formatCurrency, formatPct, log } = require('../lib/utils');
+
+module.exports = async function handler(req, res) {
+  const startTime = Date.now();
+  const logs = [];
+
+  const addLog = (msg, meta = {}) => {
+    logs.push({ time: new Date().toISOString(), msg, ...meta });
+    log('INFO', msg, meta);
+  };
+
+  try {
+    // ── 1. Security Check ──
+    const secret = req.query?.secret || req.headers?.['x-bot-secret'];
+    const expectedSecret = process.env.BOT_SECRET;
+
+    if (expectedSecret && secret !== expectedSecret) {
+      log('WARN', 'Unauthorized access attempt to bot endpoint');
+      return res.status(401).json({ error: 'Unauthorized: Invalid secret' });
+    }
+
+    addLog('🚀 Starting Loaf Markets Expert Algorithmic Trading Loop');
+
+    // ── 2. Initialize Loaf Client ──
+    const apiKey = process.env.LOAF_API_KEY;
+    if (!apiKey) {
+      throw new Error('LOAF_API_KEY environment variable is not configured');
+    }
+    const client = new LoafClient({ apiKey });
+
+    // ── 3. Fetch Portfolio State ──
+    addLog('Fetching portfolio state...');
+    const portfolioComp = await client.getPortfolioComponent();
+    const cash = Number(portfolioComp.cash || portfolioComp.availableBalance || 0);
+    const positions = portfolioComp.positions || portfolioComp.components || [];
+
+    addLog(`Portfolio retrieved`, { cash: formatCurrency(cash), openPositionsCount: positions.length });
+
+    // ── 4. Scan Markets ──
+    addLog('Fetching tradeable markets list...');
+    const marketsData = await client.getMarkets();
+    const properties = Array.isArray(marketsData) ? marketsData : (marketsData.properties || marketsData.items || []);
+
+    if (!properties.length) {
+      addLog('No properties returned from API. Halting tick.');
+      return res.status(200).json({ success: true, message: 'No markets available', durationMs: Date.now() - startTime });
+    }
+
+    addLog(`Discovered ${properties.length} tradeable properties. Beginning TA analysis...`);
+
+    // ── 5. Market Data Analysis & Strategy Signals ──
+    const marketAnalyses = [];
+    
+    for (const prop of properties) {
+      const tokenName = prop.tokenName || prop.symbol || prop.name;
+      const propertyId = prop.propertyId || prop.id;
+
+      try {
+        // Fetch 1h candles (last 100)
+        const candleRes = await client.getCandles(tokenName, '1h', 100);
+        const candles = candleRes.candles || candleRes.items || candleRes || [];
+
+        if (candles.length > 0) {
+          const analysis = analyzeAsset(candles, tokenName);
+          analysis.propertyId = propertyId;
+          marketAnalyses.push(analysis);
+        }
+      } catch (err) {
+        addLog(`Error fetching candles for ${tokenName}: ${err.message}`);
+      }
+    }
+
+    // ── 6. Manage Open Positions (Exits / Stop-Loss / Take-Profit) ──
+    addLog('Evaluating open positions for exit signals...');
+    const closedPositionsSummary = [];
+
+    for (const pos of positions) {
+      const tokenName = pos.tokenName || pos.symbol;
+      const qty = Number(pos.quantity || pos.tokenQuantity || 0);
+      if (Math.abs(qty) < 0.01) continue; // Skip zero positions
+
+      const matchingAnalysis = marketAnalyses.find(a => a.tokenName === tokenName) || {
+        currentPrice: Number(pos.currentPrice || pos.markPrice || 0),
+        signal: Signal.HOLD
+      };
+
+      const currentPrice = matchingAnalysis.currentPrice || Number(pos.currentPrice || 0);
+      const exitEvaluation = shouldClosePosition(pos, currentPrice, matchingAnalysis);
+
+      if (exitEvaluation.shouldClose) {
+        addLog(`⚠️ Exit Triggered for ${tokenName}: ${exitEvaluation.reason}`);
+        
+        try {
+          let exitRes;
+          const propId = pos.propertyId || matchingAnalysis.propertyId;
+
+          if (qty > 0) {
+            // Close LONG -> Market Sell
+            exitRes = await client.marketSell(propId, tokenName, Math.abs(qty));
+          } else {
+            // Close SHORT -> Market Buy
+            exitRes = await client.marketBuy(propId, tokenName, Math.abs(qty));
+          }
+
+          closedPositionsSummary.push({
+            tokenName,
+            quantity: Math.abs(qty),
+            reason: exitEvaluation.reason,
+            orderId: exitRes?.orderId || exitRes?.id || 'OK'
+          });
+
+          addLog(`✅ Successfully closed position in ${tokenName}`);
+        } catch (exitErr) {
+          addLog(`❌ Failed to close position ${tokenName}: ${exitErr.message}`);
+        }
+      } else {
+        addLog(`Holding position in ${tokenName}: ${exitEvaluation.reason}`);
+      }
+    }
+
+    // ── 7. Evaluate & Execute New Position Entries ──
+    addLog('Ranking new trade opportunities...');
+    const rankedOpportunities = rankOpportunities(marketAnalyses);
+    const executedTradesSummary = [];
+
+    for (const opp of rankedOpportunities) {
+      // Only process actionable signals (BUY / STRONG_BUY)
+      if (opp.signal !== Signal.BUY && opp.signal !== Signal.STRONG_BUY) continue;
+
+      // Check if we already hold this token
+      const existing = positions.find(p => p.tokenName === opp.tokenName && Math.abs(Number(p.quantity || 0)) > 0.01);
+      if (existing) {
+        addLog(`Skipping new entry for ${opp.tokenName}: Position already open.`);
+        continue;
+      }
+
+      // Check orderbook liquidity & spread
+      try {
+        const detail = await client.getMarketDetail(opp.tokenName);
+        const obValidation = validateOrderBook(detail);
+
+        if (!obValidation.valid) {
+          addLog(`Skipping ${opp.tokenName}: ${obValidation.reason}`);
+          continue;
+        }
+
+        // Calculate risk-adjusted position size
+        const posSizing = calculatePositionSize(portfolioComp, opp, obValidation.midPrice);
+
+        if (!posSizing.approved) {
+          addLog(`Risk Manager declined ${opp.tokenName}: ${posSizing.reason}`);
+          continue;
+        }
+
+        addLog(`⚡ EXECUTING ENTRY: ${opp.signal} on ${opp.tokenName}`, {
+          quantity: posSizing.quantity,
+          allocationUsd: posSizing.allocationUsd,
+          price: obValidation.bestAsk
+        });
+
+        // Place Order (Passive limit order at best ask or market order depending on strength)
+        let orderRes;
+        if (opp.signal === Signal.STRONG_BUY) {
+          // Market order for immediate fill on high conviction
+          orderRes = await client.marketBuy(opp.propertyId, opp.tokenName, posSizing.quantity);
+        } else {
+          // Limit order at best ask to avoid overpaying
+          orderRes = await client.limitBuy(opp.propertyId, opp.tokenName, posSizing.quantity, obValidation.bestAsk);
+        }
+
+        executedTradesSummary.push({
+          tokenName: opp.tokenName,
+          signal: opp.signal,
+          quantity: posSizing.quantity,
+          price: obValidation.bestAsk,
+          allocationUsd: posSizing.allocationUsd,
+          orderId: orderRes?.orderId || orderRes?.id || 'ACCEPTED',
+          reason: opp.reason
+        });
+
+        addLog(`🎉 Order Accepted for ${opp.tokenName}! Order ID: ${orderRes?.orderId || 'ACCEPTED'}`);
+
+      } catch (tradeErr) {
+        addLog(`❌ Execution Error on ${opp.tokenName}: ${tradeErr.message}`);
+      }
+    }
+
+    // ── 8. Return Execution Summary Response ──
+    const durationMs = Date.now() - startTime;
+    addLog(`🏁 Trading loop completed in ${durationMs}ms`);
+
+    return res.status(200).json({
+      success: true,
+      timestamp: new Date().toISOString(),
+      durationMs,
+      portfolioState: {
+        cash: formatCurrency(cash),
+        openPositions: positions.length,
+      },
+      marketSummary: {
+        totalScanned: properties.length,
+        analyzed: marketAnalyses.length,
+        actionableSignals: rankedOpportunities.length
+      },
+      actionsTaken: {
+        closedPositions: closedPositionsSummary,
+        newTradesPlaced: executedTradesSummary
+      },
+      logs
+    });
+
+  } catch (error) {
+    log('ERROR', 'Fatal bot execution error', { error: error.message, stack: error.stack });
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+      durationMs: Date.now() - startTime,
+      logs
+    });
+  }
+};

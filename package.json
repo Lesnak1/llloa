@@ -1,0 +1,13 @@
+{
+  "name": "loaf-trading-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Expert algorithmic trading bot for Loaf Markets League of Loaf testnet competition",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "dev": "node api/bot.js",
+    "test": "node test.js"
+  }
+}
