@@ -21,7 +21,7 @@ const { formatCurrency, formatPct, log } = require('../lib/utils');
 // Key: tokenName, Value: timestamp of last stop-loss exit
 // Persisted across ticks via global scope in Vercel serverless (warm starts)
 const stopLossCooldowns = global.__stopLossCooldowns || (global.__stopLossCooldowns = {});
-const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes cooldown after stop-loss
+const COOLDOWN_MS = 3 * 60 * 1000; // 3 minutes cooldown after stop-loss
 
 module.exports = async function handler(req, res) {
   const startTime = Date.now();
