@@ -231,8 +231,31 @@ module.exports = async function handler(req, res) {
           continue;
         }
 
-        // Calculate risk-adjusted position size
-        const posSizing = calculatePositionSize(portfolioComp, opp, obValidation.midPrice);
+        // Calculate win-streak count for Smart Anti-Martingale compounding
+        let winStreakCount = 0;
+        try {
+          const hist = await client.getOrderHistory(1, 10);
+          const recentSells = (hist.orders || []).filter(o => o.side === 'SELL' && o.status === 'FILLED');
+          if (recentSells.length > 0) {
+            // Fetch matching buy prices to check win/loss streak
+            const recentBuys = (hist.orders || []).filter(o => o.side === 'BUY' && o.status === 'FILLED');
+            for (const s of recentSells) {
+              const matchingBuy = recentBuys.find(b => b.tokenName === s.tokenName && b.createdAt <= s.createdAt);
+              if (matchingBuy) {
+                if (Number(s.price) > Number(matchingBuy.price)) {
+                  winStreakCount++;
+                } else {
+                  break; // streak broken on first loss
+                }
+              }
+            }
+          }
+        } catch (stErr) {
+          // fallback winStreakCount = 0
+        }
+
+        // Calculate risk-adjusted position size with Smart Anti-Martingale Compounding
+        const posSizing = calculatePositionSize(portfolioComp, opp, obValidation.midPrice, winStreakCount);
 
         if (!posSizing.approved) {
           addLog(`Risk Manager declined ${opp.tokenName}: ${posSizing.reason}`);
