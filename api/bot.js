@@ -17,6 +17,12 @@ const { analyzeAsset, rankOpportunities, shouldClosePosition, Signal } = require
 const { calculatePositionSize, validateOrderBook } = require('../lib/risk');
 const { formatCurrency, formatPct, log } = require('../lib/utils');
 
+// ── Stop-Loss Cooldown Tracker (prevents re-entry after recent stop-out) ──
+// Key: tokenName, Value: timestamp of last stop-loss exit
+// Persisted across ticks via global scope in Vercel serverless (warm starts)
+const stopLossCooldowns = global.__stopLossCooldowns || (global.__stopLossCooldowns = {});
+const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes cooldown after stop-loss
+
 module.exports = async function handler(req, res) {
   const startTime = Date.now();
   const logs = [];
@@ -154,19 +160,32 @@ module.exports = async function handler(req, res) {
           let exitRes;
           const propId = pos.propertyId || matchingAnalysis.propertyId;
 
-          // Fetch orderbook detail to place slippage-protected limit exit order at bestBid
+          // Fetch orderbook detail to place slippage-protected limit exit order
           const exitDetail = await client.getMarketDetail(tokenName);
           const bids = exitDetail?.bids || exitDetail?.orderBook?.bids || [];
           const asks = exitDetail?.asks || exitDetail?.orderBook?.asks || [];
           const bestBid = bids.length ? Number(bids[0].price || bids[0][0]) : currentPrice;
           const bestAsk = asks.length ? Number(asks[0].price || asks[0][0]) : currentPrice;
 
+          // ── FLASH CRASH SELL-PRICE FLOOR ──
+          // Enforce minimum sell price from strategy (entry * 0.92)
+          // This prevents catastrophic fills during flash crashes
+          const minSellPrice = exitEvaluation.minSellPrice || 0;
+
           if (qty > 0) {
-            // Close LONG -> Limit Sell at bestBid (prevents orderbook slippage)
-            exitRes = await client.limitSell(propId, tokenName, Math.abs(qty), bestBid || currentPrice);
+            // Close LONG -> Limit Sell at MAX(bestBid, minSellPrice)
+            const safeSellPrice = Math.max(bestBid || currentPrice, minSellPrice);
+            addLog(`Flash crash floor: bestBid=$${bestBid}, minSellPrice=$${minSellPrice}, using=$${safeSellPrice}`);
+            exitRes = await client.limitSell(propId, tokenName, Math.abs(qty), safeSellPrice);
           } else {
             // Close SHORT -> Limit Buy at bestAsk
             exitRes = await client.limitBuy(propId, tokenName, Math.abs(qty), bestAsk || currentPrice);
+          }
+
+          // Record stop-loss cooldown to prevent immediate re-entry
+          if (exitEvaluation.reason.includes('Stop-loss') || exitEvaluation.reason.includes('stop-loss')) {
+            stopLossCooldowns[tokenName] = Date.now();
+            addLog(`🛡️ Cooldown activated for ${tokenName}: no re-entry for 30 minutes`);
           }
 
           closedPositionsSummary.push({
@@ -198,6 +217,14 @@ module.exports = async function handler(req, res) {
       const existing = positions.find(p => p.tokenName === opp.tokenName && Math.abs(Number(p.quantity || 0)) > 0.01);
       if (existing) {
         addLog(`Skipping new entry for ${opp.tokenName}: Position already open.`);
+        continue;
+      }
+
+      // Check stop-loss cooldown (prevent re-entry after recent stop-out)
+      const lastStopTime = stopLossCooldowns[opp.tokenName] || 0;
+      if (Date.now() - lastStopTime < COOLDOWN_MS) {
+        const minutesLeft = Math.ceil((COOLDOWN_MS - (Date.now() - lastStopTime)) / 60000);
+        addLog(`🛡️ Skipping ${opp.tokenName}: Stop-loss cooldown active (${minutesLeft}min remaining)`);
         continue;
       }
 
