@@ -45,13 +45,56 @@ module.exports = async function handler(req, res) {
     }
     const client = new LoafClient({ apiKey });
 
-    // ── 3. Fetch Portfolio State ──
-    addLog('Fetching portfolio state...');
+    // ── 3. Fetch Portfolio State & Full Account Audit ──
+    addLog('Fetching portfolio & account state...');
     const portfolioComp = await client.getPortfolioComponent();
     const cash = Number(portfolioComp.cash || portfolioComp.availableBalance || 0);
+    const frozen = Number(portfolioComp.frozen || 0);
     const positions = portfolioComp.positions || portfolioComp.components || [];
+    const openOrders = portfolioComp.openOrders || [];
+    const offeringOrders = portfolioComp.offeringOrders || [];
 
-    addLog(`Portfolio retrieved`, { cash: formatCurrency(cash), openPositionsCount: positions.length });
+    addLog(`Portfolio retrieved`, {
+      cash: formatCurrency(cash),
+      frozen: formatCurrency(frozen),
+      openPositionsCount: positions.length,
+      openOrdersCount: openOrders.length,
+      offeringOrdersCount: offeringOrders.length,
+    });
+
+    // ── 3b. Open Orders Management (Cancel Stale Orders to Unfreeze Cash) ──
+    if (openOrders.length > 0) {
+      addLog(`Auditing ${openOrders.length} Open Orders (unfreezing stale liquidity)...`);
+      for (const order of openOrders) {
+        const orderId = order.orderId || order.id;
+        const tokenName = order.tokenName || order.symbol;
+        const price = Number(order.price || 0);
+        
+        // Fetch current market detail to check if open order is far from best bid/ask
+        try {
+          if (tokenName) {
+            const detail = await client.getMarketDetail(tokenName);
+            const bids = detail?.bids || detail?.orderBook?.bids || [];
+            const asks = detail?.asks || detail?.orderBook?.asks || [];
+            const bestBid = bids.length ? Number(bids[0].price || bids[0][0]) : 0;
+            const bestAsk = asks.length ? Number(asks[0].price || asks[0][0]) : 0;
+
+            // If order price is >3% away from current market, cancel it to unfreeze cash
+            const isFar = order.side === 'BUY'
+              ? (bestAsk > 0 && (bestAsk - price) / bestAsk > 0.03)
+              : (bestBid > 0 && (price - bestBid) / price > 0.03);
+
+            if (isFar) {
+              addLog(`Cancelling stale order #${orderId} on ${tokenName} (Price $${price} is far from market $${bestAsk || bestBid})`);
+              await client.cancelOrder(orderId);
+              addLog(`✅ Order #${orderId} cancelled. Cash unfrozen!`);
+            }
+          }
+        } catch (ordErr) {
+          addLog(`Note on open order #${orderId}: ${ordErr.message}`);
+        }
+      }
+    }
 
     // ── 4. Scan Markets ──
     addLog('Fetching tradeable markets list...');
